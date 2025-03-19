@@ -1,0 +1,24 @@
+[package]
+name = "solink-tokio-file-watch"
+version = "1.0.0"
+edition = "2024"
+description = "Log flattened JSON in tracing."
+license = "MIT"
+
+[dependencies]
+serde = "1.0.203"
+serde_json = { version = "1.0.140" }
+thiserror = "2.0.12"
+tokio = { version = "1.38.0", features = ["fs", "rt", "sync"] }
+tracing = "0.1.41"
+notify = { version = "6.1.1", default-features = false, features = [
+    "macos_fsevent",
+    "serde",
+] }
+notify-debouncer-mini = { version = "0.4.1", default-features = false }
+
+
+[dev-dependencies]
+tempfile = "3.19.1"
+tokio = { version = "1.38.0", features = ["rt", "macros"] }
+serde_json = { version = "1.0.140" }

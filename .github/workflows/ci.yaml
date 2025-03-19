@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+jobs:
+  ci:
+    strategy:
+      matrix:
+        version:
+          - 1.85.0 # Minimum supported Rust version
+          - stable
+          - nightly
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install ${{ matrix.version }} --no-self-update
+          rustup override set ${{ matrix.version }}
+      - name: tests
+        run: cargo test
