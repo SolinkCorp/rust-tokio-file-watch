@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "solink-tokio-file-watch"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "notify",
  "notify-debouncer-mini",

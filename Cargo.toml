@@ -1,7 +1,7 @@
 [package]
 name = "solink-tokio-file-watch"
-version = "1.0.0"
-edition = "2024"
+version = "1.0.1"
+edition = "2021"
 description = "Log flattened JSON in tracing."
 license = "MIT"
 
