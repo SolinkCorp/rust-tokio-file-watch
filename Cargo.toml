@@ -5,13 +5,9 @@ edition = "2021"
 description = "A reusable file watcher"
 license = "MIT"
 
-[features]
-default = []
-
 [dependencies]
 serde = "1.0.203"
 serde_json = { version = "1.0.140" }
-futures-core = { version = "0.3.30", optional = true }
 trait-variant = "0.1.2"
 thiserror = "2.0.12"
 tokio = { version = "1.38.0", features = ["io-util", "fs", "rt", "sync"] }
