@@ -88,14 +88,14 @@ where
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if let Ok(parsed) = parse(path, &line)
-                        .map_err(|err| error!(%err, path =% path.display(), "Error parsing data"))
+                        .map_err(|err| error!(%err, path = %path.display(), "Error parsing data"))
                     {
                         output.push(parsed);
                     }
                 }
                 Ok(None) => break, // EOF reached
                 Err(err) => {
-                    error!(%err, path =% path.display(), "Error reading line from file");
+                    error!(%err, path = %path.display(), "Error reading line from file");
                     break;
                 }
             }
@@ -227,6 +227,51 @@ mod tests {
             assert_eq!(vec.len(), 2);
             assert_eq!(vec[0]["message"], "Hello World 2!");
             assert_eq!(vec[1]["message"], "Hello Again 2!");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_lines_with_some_parsing_issues() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        fs::write(
+            &file_path,
+            r#"{"message": "Hello World!"}
+            {"message": BROKEN}
+{"message": "Hello Again!"}"#,
+        )
+        .await
+        .unwrap();
+
+        let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        {
+            let value = watcher.borrow();
+            let vec = value.as_ref().unwrap();
+            assert_eq!(vec.len(), 2);
+            assert_eq!(vec[0]["message"], "Hello World!");
+            assert_eq!(vec[1]["message"], "Hello Again!");
+        }
+
+        fs::write(
+            &file_path,
+            r#"{"message": "Hello World 2!"}
+{"message": "Hello Again 2!"}
+zzzz
+{"message": "Hello Again Again 2!"}"#,
+        )
+        .await
+        .unwrap();
+
+        // Wait for the file to change
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            let vec = value.as_ref().unwrap();
+            assert_eq!(vec.len(), 3);
+            assert_eq!(vec[0]["message"], "Hello World 2!");
+            assert_eq!(vec[1]["message"], "Hello Again 2!");
+            assert_eq!(vec[2]["message"], "Hello Again Again 2!");
         }
     }
 }
