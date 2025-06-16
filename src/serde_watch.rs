@@ -92,6 +92,9 @@ where
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue; // Skip empty lines
+                    }
                     if let Ok(parsed) = parse(path, &line)
                         .map_err(|err| error!(%err, path = %path.display(), "Error parsing data"))
                     {
@@ -160,10 +163,12 @@ where
 mod tests {
     use serde_json::Value;
     use tempfile::TempDir;
+    use tracing_test::traced_test;
 
     use super::*;
 
     #[tokio::test]
+    #[traced_test]
     async fn test_update() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("file.txt");
@@ -193,6 +198,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_update_lines() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("file.txt");
@@ -236,6 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_update_lines_with_some_parsing_issues() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("file.txt");
@@ -260,10 +267,7 @@ mod tests {
 
         fs::write(
             &file_path,
-            r#"{"message": "Hello World 2!"}
-{"message": "Hello Again 2!"}
-zzzz
-{"message": "Hello Again Again 2!"}"#,
+            "{\"message\":\"Hello World 2!\"}\n{\"message\": \"Hello Again 2!\"}\r\nzzzz\n{\"message\": \"Hello Again Again 2!\"}\n\r",
         )
         .await
         .unwrap();
