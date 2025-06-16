@@ -4,6 +4,10 @@ version = "1.0.1"
 edition = "2021"
 description = "A reusable file watcher"
 license = "MIT"
+repository = "https://github.com/SolinkCorp/rust-tokio-file-watch"
+homepage = "https://github.com/SolinkCorp/rust-tokio-file-watch"
+documentation = "https://docs.rs/solink-tokio-file-watch"
+
 
 [dependencies]
 serde = "1.0.203"
