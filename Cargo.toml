@@ -2,14 +2,15 @@
 name = "solink-tokio-file-watch"
 version = "1.0.1"
 edition = "2021"
-description = "Log flattened JSON in tracing."
+description = "A reusable file watcher"
 license = "MIT"
 
 [dependencies]
 serde = "1.0.203"
 serde_json = { version = "1.0.140" }
+trait-variant = "0.1.2"
 thiserror = "2.0.12"
-tokio = { version = "1.38.0", features = ["fs", "rt", "sync"] }
+tokio = { version = "1.38.0", features = ["io-util", "fs", "rt", "sync"] }
 tracing = "0.1.41"
 notify = { version = "6.1.1", default-features = false, features = [
     "macos_fsevent",
@@ -22,3 +23,4 @@ notify-debouncer-mini = { version = "0.4.1", default-features = false }
 tempfile = "3.19.1"
 tokio = { version = "1.38.0", features = ["rt", "macros"] }
 serde_json = { version = "1.0.140" }
+tracing-test = "0.2"
