@@ -26,29 +26,36 @@ pub async fn json_watch<T>(path: impl AsRef<Path>) -> Result<JsonWatch<T>, Error
 where
     T: Clone + DeserializeOwned + Send + Sync + 'static,
 {
-    serde_watch::<T, _, StringLoader<T>, _>(path, |path, data| {
+    serde_watch::<T, _, StringLoader, _>(path, |path, data| {
         serde_json::from_str(data)
             .map_err(|e| Error::DecodeError(path.to_string_lossy().to_string(), e.to_string()))
     })
     .await
 }
 
+/// Watch a JSON Lines file for changes.
+///
+/// A JSON Lines file is a file where each line is a separate JSON object.
+/// This will return a Vec of deserialized objects, where each line in the file is a separate JSON object.
+/// If a line contains invalid JSON, it will be skipped, and the rest of the lines will be processed.
+/// If the contents of the file are removed, the value in the receiver will not change.
+///
+/// This function uses a buffered reader to read the file and split it into lines. But it still returns the deserialized
+/// objects all at once, so it is not a stream of updates and it may not be suitable for very large files.
 pub async fn jsonlines_watch<T>(path: impl AsRef<Path>) -> Result<JsonWatch<Vec<T>>, Error>
 where
     T: Clone + DeserializeOwned + Send + Sync + 'static,
 {
-    serde_watch::<T, _, LinesLoader<T>, Vec<T>>(path, |path, data| {
+    serde_watch::<T, _, LinesLoader, Vec<T>>(path, |path, data| {
         serde_json::from_str(data)
             .map_err(|e| Error::DecodeError(path.to_string_lossy().to_string(), e.to_string()))
     })
     .await
 }
 
-struct StringLoader<T> {
-    _marker: std::marker::PhantomData<T>,
-}
+struct StringLoader;
 
-impl<T: Send> Loader<T, T> for StringLoader<T> {
+impl<T: Send> Loader<T, T> for StringLoader {
     type Parse = fn(&Path, &str) -> Result<T, Error>;
 
     async fn load(path: &Path, parse: &Self::Parse) -> Option<T> {
@@ -64,11 +71,9 @@ impl<T: Send> Loader<T, T> for StringLoader<T> {
     }
 }
 
-struct LinesLoader<T> {
-    _marker: std::marker::PhantomData<T>,
-}
+struct LinesLoader;
 
-impl<T> Loader<T, Vec<T>> for LinesLoader<T>
+impl<T> Loader<T, Vec<T>> for LinesLoader
 where
     T: Clone + DeserializeOwned + Send + Sync + 'static,
 {
