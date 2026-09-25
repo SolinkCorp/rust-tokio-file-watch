@@ -1,6 +1,10 @@
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer};
-use std::{ffi::OsString, path::Path, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{fs, sync::watch};
 use tracing::warn;
 
@@ -49,6 +53,9 @@ impl AsyncFsWatch {
         fs::create_dir_all(&path_to_watch)
             .await
             .map_err(|e| Error::InvalidPath(format!("Could not create {path_to_watch:?}: {e}")))?;
+        let canonical_watch_dir: PathBuf = path_to_watch.canonicalize().map_err(|e| {
+            Error::InvalidPath(format!("Could not canonicalize {path_to_watch:?}: {e}"))
+        })?;
         let files = files.to_vec();
 
         let mut debouncer = {
@@ -57,31 +64,39 @@ impl AsyncFsWatch {
                 debounce,
                 move |res: DebounceEventResult| match res {
                     Ok(events) => {
-                        // Ignore any events not for our desired path. We need to
-                        // canonicalize the paths from the event here, because it
-                        // might already be canonicalized.  We also need to canonicalize
-                        // the path we're looking for - we can't do this above
-                        // outside the debouncer, because canonicalization will fail
-                        // if the path doesn't exist.
+                        // Ignore any events not for our watched file.
+                        //
+                        // We canonicalize the watch directory once, before this closure runs.
+                        // The directory still exists after the file is deleted, so this
+                        // canonicalization cannot fail because of the delete.
+                        //
+                        // We do not canonicalize the event path itself. The target file
+                        // may not exist anymore. Instead, we canonicalize the event's parent
+                        // directory, and compare it to the watch directory. Then we compare
+                        // the file name directly.
 
                         // TODO: If we upgrade notify to 7.0.0 and notify-debouncer-mini to 0.5.0,
                         // this will start firing more or less continuously on the QNAP,
                         // even though the file isn't being modified.  :(
                         for event in events {
-                            if let Ok(event_path) = event.path.canonicalize() {
-                                for file in &files {
-                                    if let Ok(file_path) = path_to_watch.join(file).canonicalize() {
-                                        if event_path == file_path {
-                                            if let Err(err) = tx.send(()) {
-                                                warn!(
-                                                    ?err,
-                                                    ?event_path,
-                                                    "Error sending notification"
-                                                );
-                                            }
-                                            break;
-                                        }
+                            let Some(event_dir) = event.path.parent() else {
+                                continue;
+                            };
+                            let Ok(canonical_event_dir) = event_dir.canonicalize() else {
+                                continue;
+                            };
+                            if canonical_event_dir != canonical_watch_dir {
+                                continue;
+                            }
+                            let Some(event_filename) = event.path.file_name() else {
+                                continue;
+                            };
+                            for file in &files {
+                                if event_filename == file.as_os_str() {
+                                    if let Err(err) = tx.send(()) {
+                                        warn!(?err, ?event.path, "Error sending notification");
                                     }
+                                    break;
                                 }
                             }
                         }
@@ -141,6 +156,23 @@ mod test {
 
         // Create the file
         fs::write(&file_path, "Hello, world!").unwrap();
+
+        // Wait for the file to change
+        watcher.changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // Create the file
+        fs::write(&file_path, "Hello, world!").unwrap();
+
+        let mut watcher = AsyncFsWatch::watch(&file_path).await.unwrap();
+
+        // Delete the file
+        fs::remove_file(&file_path).unwrap();
 
         // Wait for the file to change
         watcher.changed().await.unwrap();
