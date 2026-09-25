@@ -194,6 +194,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::settle;
 
     #[tokio::test]
     #[traced_test]
@@ -207,6 +208,7 @@ mod tests {
             .unwrap();
 
         let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
@@ -241,6 +243,7 @@ mod tests {
         .unwrap();
 
         let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             let vec = value.as_ref().unwrap();
@@ -285,6 +288,7 @@ mod tests {
         .unwrap();
 
         let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             let vec = value.as_ref().unwrap();
@@ -323,6 +327,7 @@ mod tests {
             .await
             .unwrap();
         let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
@@ -352,6 +357,7 @@ mod tests {
         .await
         .unwrap();
         let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
 
         {
             let value = watcher.borrow();
@@ -380,6 +386,7 @@ mod tests {
             .await
             .unwrap();
         let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
 
         {
             let value = watcher.borrow();
