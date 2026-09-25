@@ -16,11 +16,19 @@ use super::fs_watch::AsyncFsWatch;
 
 pub type JsonWatch<T> = watch::Receiver<Option<T>>;
 
+enum LoadOutcome<R> {
+    Loaded(R),
+    Missing,
+    Invalid,
+}
+
 /// Watch a JSON file for changes.
 ///
-/// This will update the value in the returned receiver whenever the file changes.
-/// If the contents of the file are removed or are invalid, the value in the receiver
-/// will not change.
+/// This function updates the value in the returned receiver each time the file changes.
+///
+/// If the file is deleted, the receiver's value becomes `None`.
+/// If the file exists but its contents cannot be parsed, the value in the receiver
+/// does not change.
 ///
 pub async fn json_watch<T>(path: impl AsRef<Path>) -> Result<JsonWatch<T>, Error>
 where
@@ -35,13 +43,16 @@ where
 
 /// Watch a JSON Lines file for changes.
 ///
-/// A JSON Lines file is a file where each line is a separate JSON object.
-/// This will return a Vec of deserialized objects, where each line in the file is a separate JSON object.
-/// If a line contains invalid JSON, it will be skipped, and the rest of the lines will be processed.
-/// If the contents of the file are removed, the value in the receiver will not change.
+/// A JSON Lines file is a file where each line holds one JSON object.
+/// This function returns a Vec of the deserialized objects, one per line.
+/// If a line contains invalid JSON, the function skips that line and processes the rest.
 ///
-/// This function uses a buffered reader to read the file and split it into lines. But it still returns the deserialized
-/// objects all at once, so it is not a stream of updates and it may not be suitable for very large files.
+/// If the file is deleted, the receiver's value becomes `None`.
+/// If the file exists but cannot be opened, the value in the receiver does not change.
+///
+/// This function uses a buffered reader to read the file and split it into lines. It
+/// still returns all the deserialized objects at once. It is not a stream of updates,
+/// so it may not suit very large files.
 pub async fn jsonlines_watch<T>(path: impl AsRef<Path>) -> Result<JsonWatch<Vec<T>>, Error>
 where
     T: Clone + DeserializeOwned + Send + Sync + 'static,
@@ -58,14 +69,19 @@ struct StringLoader;
 impl<T: Send> Loader<T, T> for StringLoader {
     type Parse = fn(&Path, &str) -> Result<T, Error>;
 
-    async fn load(path: &Path, parse: &Self::Parse) -> Option<T> {
+    async fn load(path: &Path, parse: &Self::Parse) -> LoadOutcome<T> {
         match fs::read_to_string(path).await {
-            Ok(data) => parse(path, &data)
-                .map_err(|err| error!(?err, ?path, "Error parsing data"))
-                .ok(),
+            Ok(data) => match parse(path, &data) {
+                Ok(value) => LoadOutcome::Loaded(value),
+                Err(err) => {
+                    error!(%err, path = %path.display(), "Error parsing data");
+                    LoadOutcome::Invalid
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadOutcome::Missing,
             Err(err) => {
-                error!(?err, ?path, "Error reading file");
-                None
+                error!(%err, path = %path.display(), "Error reading file");
+                LoadOutcome::Invalid
             }
         }
     }
@@ -79,13 +95,16 @@ where
 {
     type Parse = fn(&Path, &str) -> Result<T, Error>;
 
-    async fn load(path: &Path, parse: &Self::Parse) -> Option<Vec<T>> {
-        let Ok(file) = File::open(path)
-            .await
-            .map_err(|err| error!(%err, path = %path.display(), "Error opening file"))
-        else {
-            return None;
+    async fn load(path: &Path, parse: &Self::Parse) -> LoadOutcome<Vec<T>> {
+        let file = match File::open(path).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
+            Err(err) => {
+                error!(%err, path = %path.display(), "Error opening file");
+                return LoadOutcome::Invalid;
+            }
         };
+
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let mut output = Vec::new();
@@ -108,7 +127,7 @@ where
                 }
             }
         }
-        Some(output)
+        LoadOutcome::Loaded(output)
     }
 }
 
@@ -116,7 +135,7 @@ where
 trait LocalLoader<T, R> {
     type Parse;
     #[allow(dead_code)]
-    async fn load(path: &Path, parse: &Self::Parse) -> Option<R>;
+    async fn load(path: &Path, parse: &Self::Parse) -> LoadOutcome<R>;
 }
 
 async fn serde_watch<T, F, L, R>(
@@ -130,10 +149,17 @@ where
     R: Send + Sync + 'static,
 {
     let path = path.as_ref();
-    let initial_value = L::load(path, &parse).await;
-    if initial_value.is_none() {
-        error!(path = %path.display(), "File does not exist or is empty.");
-    }
+    let initial_value = match L::load(path, &parse).await {
+        LoadOutcome::Loaded(value) => Some(value),
+        LoadOutcome::Missing => {
+            error!(path = %path.display(), "File does not exist.");
+            None
+        }
+        LoadOutcome::Invalid => {
+            error!(path = %path.display(), "File exists but could not be loaded.");
+            None
+        }
+    };
     let (tx, rx) = watch::channel(initial_value);
     let mut watch = AsyncFsWatch::watch(&path).await?;
 
@@ -145,13 +171,15 @@ where
                 break;
             }
 
-            let new_value = L::load(&path, &parse).await;
-            if new_value.is_some() {
-                let result = tx.send(new_value);
-                if result.is_err() {
-                    info!(path = %path.display(), "Watch for file is closed.");
-                    break;
-                }
+            let send_result = match L::load(&path, &parse).await {
+                LoadOutcome::Loaded(value) => Some(tx.send(Some(value))),
+                LoadOutcome::Missing => Some(tx.send(None)),
+                LoadOutcome::Invalid => None,
+            };
+
+            if let Some(Err(_)) = send_result {
+                info!(path = %path.display(), "Watch for file is closed.");
+                break;
             }
         }
     });
@@ -166,6 +194,8 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::settle;
+    use std::time::Duration;
 
     #[tokio::test]
     #[traced_test]
@@ -179,6 +209,7 @@ mod tests {
             .unwrap();
 
         let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
@@ -213,6 +244,7 @@ mod tests {
         .unwrap();
 
         let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             let vec = value.as_ref().unwrap();
@@ -257,6 +289,7 @@ mod tests {
         .unwrap();
 
         let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
         {
             let value = watcher.borrow();
             let vec = value.as_ref().unwrap();
@@ -281,6 +314,141 @@ mod tests {
             assert_eq!(vec[0]["message"], "Hello World 2!");
             assert_eq!(vec[1]["message"], "Hello Again 2!");
             assert_eq!(vec[2]["message"], "Hello Again Again 2!");
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // create the file
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+        let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
+        }
+
+        // delete the file
+        fs::remove_file(&file_path).await.unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert!(value.is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_delete_lines() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // create the file
+        fs::write(
+            &file_path,
+            r#"{"message": "Hello World!"}
+            {"message": "Hello Again!"}"#,
+        )
+        .await
+        .unwrap();
+        let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
+
+        {
+            let value = watcher.borrow();
+            let vec = value.as_ref().unwrap();
+            assert_eq!(vec.len(), 2);
+            assert_eq!(vec[0]["message"], "Hello World!");
+            assert_eq!(vec[1]["message"], "Hello Again!");
+        }
+
+        fs::remove_file(&file_path).await.unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert!(value.is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_delete_recreate() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // create the file
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+        let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
+
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
+        }
+
+        // delete the file
+        fs::remove_file(&file_path).await.unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert!(value.is_none());
+        }
+
+        // recreate the file
+        fs::write(&file_path, r#"{"message": "Hello World 2!"}"#)
+            .await
+            .unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World 2!");
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_invalid_keeps_last_value() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // Create the file
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+
+        let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
+
+        // Write data that is not valid JSON, for example a torn write
+        fs::write(&file_path, r#"{"message": "#).await.unwrap();
+
+        // Make sure that there is no notification, and that the last good value stays
+        let result = tokio::time::timeout(Duration::from_secs(3), watcher.changed()).await;
+        assert!(result.is_err(), "invalid data caused a notification");
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
+        }
+
+        // Write valid data again. This shows that the watcher still operates.
+        fs::write(&file_path, r#"{"message": "Hello World 2!"}"#)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("no change seen after valid data")
+            .unwrap();
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World 2!");
         }
     }
 }

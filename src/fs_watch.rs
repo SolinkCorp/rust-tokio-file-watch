@@ -1,6 +1,10 @@
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer};
-use std::{ffi::OsString, path::Path, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{fs, sync::watch};
 use tracing::warn;
 
@@ -49,6 +53,9 @@ impl AsyncFsWatch {
         fs::create_dir_all(&path_to_watch)
             .await
             .map_err(|e| Error::InvalidPath(format!("Could not create {path_to_watch:?}: {e}")))?;
+        let canonical_watch_dir: PathBuf = path_to_watch.canonicalize().map_err(|e| {
+            Error::InvalidPath(format!("Could not canonicalize {path_to_watch:?}: {e}"))
+        })?;
         let files = files.to_vec();
 
         let mut debouncer = {
@@ -57,31 +64,21 @@ impl AsyncFsWatch {
                 debounce,
                 move |res: DebounceEventResult| match res {
                     Ok(events) => {
-                        // Ignore any events not for our desired path. We need to
-                        // canonicalize the paths from the event here, because it
-                        // might already be canonicalized.  We also need to canonicalize
-                        // the path we're looking for - we can't do this above
-                        // outside the debouncer, because canonicalization will fail
-                        // if the path doesn't exist.
+                        // Ignore any events not for our watched file.
+                        //
+                        // We canonicalize the watch directory once, before this closure runs.
+                        // The directory still exists after the file is deleted, so this
+                        // canonicalization cannot fail because of the delete.
+                        //
+                        // See `is_watched` for how we match an event to a watched file.
 
                         // TODO: If we upgrade notify to 7.0.0 and notify-debouncer-mini to 0.5.0,
                         // this will start firing more or less continuously on the QNAP,
                         // even though the file isn't being modified.  :(
                         for event in events {
-                            if let Ok(event_path) = event.path.canonicalize() {
-                                for file in &files {
-                                    if let Ok(file_path) = path_to_watch.join(file).canonicalize() {
-                                        if event_path == file_path {
-                                            if let Err(err) = tx.send(()) {
-                                                warn!(
-                                                    ?err,
-                                                    ?event_path,
-                                                    "Error sending notification"
-                                                );
-                                            }
-                                            break;
-                                        }
-                                    }
+                            if Self::is_watched(&event.path, &canonical_watch_dir, &files) {
+                                if let Err(err) = tx.send(()) {
+                                    warn!(?err, ?event.path, "Error sending notification");
                                 }
                             }
                         }
@@ -106,6 +103,36 @@ impl AsyncFsWatch {
     pub async fn changed(&mut self) -> Result<(), Error> {
         self.rx.changed().await.map_err(|_| Error::WatcherStopped)
     }
+
+    /// Return true if the event path is one of the watched files.
+    fn is_watched(event_path: &Path, canonical_watch_dir: &Path, files: &[OsString]) -> bool {
+        // Match by name. We canonicalize only the parent directory, because the
+        // file may not exist anymore. This match finds deletes.
+        let same_dir = event_path
+            .parent()
+            .and_then(|dir| dir.canonicalize().ok())
+            .is_some_and(|dir| dir == canonical_watch_dir);
+        if same_dir
+            && event_path
+                .file_name()
+                .is_some_and(|name| files.iter().any(|f| f == name))
+        {
+            return true;
+        }
+        // Match by resolved target. This match finds changes to a file that a watched
+        // name links to, in the same directory. Both paths must exist, so this match
+        // cannot find a delete. We resolve the watched file on each event, because the
+        // link can change to a different target.
+        let Ok(canonical_event) = event_path.canonicalize() else {
+            return false;
+        };
+        files.iter().any(|f| {
+            canonical_watch_dir
+                .join(f)
+                .canonicalize()
+                .is_ok_and(|p| p == canonical_event)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +140,7 @@ mod test {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_utils::settle;
     use std::fs;
 
     #[tokio::test]
@@ -124,6 +152,7 @@ mod test {
         fs::write(&file_path, "Hello, world!").unwrap();
 
         let mut watcher = AsyncFsWatch::watch(&file_path).await.unwrap();
+        settle(&mut watcher.rx).await;
 
         // Update the file
         fs::write(&file_path, "Hello, world 2!").unwrap();
@@ -144,6 +173,72 @@ mod test {
 
         // Wait for the file to change
         watcher.changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // Create the file
+        fs::write(&file_path, "Hello, world!").unwrap();
+
+        let mut watcher = AsyncFsWatch::watch(&file_path).await.unwrap();
+        settle(&mut watcher.rx).await;
+
+        // Delete the file
+        fs::remove_file(&file_path).unwrap();
+
+        // Wait for the file to change
+        watcher.changed().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlink_target_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("config.v2.json");
+        let link_path = temp_dir.path().join("config.json");
+
+        // Create the target, and a symlink to it in the same folder
+        fs::write(&target_path, "Hello, world!").unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        let mut watcher = AsyncFsWatch::watch(&link_path).await.unwrap();
+        settle(&mut watcher.rx).await;
+
+        // Update the target directly, not through the symlink
+        fs::write(&target_path, "Hello, world 2!").unwrap();
+
+        // Wait for the file to change. Use a timeout so that a missed event fails the test.
+        tokio::time::timeout(Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("no change seen for symlink target")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlink_write_through_link() {
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("config.v2.json");
+        let link_path = temp_dir.path().join("config.json");
+
+        // Create the target, and a symlink to it in the same folder
+        fs::write(&target_path, "Hello, world!").unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        let mut watcher = AsyncFsWatch::watch(&link_path).await.unwrap();
+        settle(&mut watcher.rx).await;
+
+        // Update the target through the symlink
+        fs::write(&link_path, "Hello, world 2!").unwrap();
+
+        // Wait for the file to change. Use a timeout so that a missed event fails the test.
+        tokio::time::timeout(Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("no change seen when writing through symlink")
+            .unwrap();
     }
 
     #[tokio::test]
