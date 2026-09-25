@@ -368,4 +368,40 @@ mod tests {
             assert!(value.is_none());
         }
     }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_delete_recreate() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // create the file
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+        let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
+        }
+
+        // delete the file
+        fs::remove_file(&file_path).await.unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert!(value.is_none());
+        }
+
+        // recreate the file
+        fs::write(&file_path, r#"{"message": "Hello World 2!"}"#)
+            .await
+            .unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World 2!");
+        }
+    }
 }
