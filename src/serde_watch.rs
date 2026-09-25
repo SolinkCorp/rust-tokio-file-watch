@@ -17,9 +17,9 @@ use super::fs_watch::AsyncFsWatch;
 pub type JsonWatch<T> = watch::Receiver<Option<T>>;
 
 enum LoadOutcome<R> {
-    Loaded(R), 
-    Missing, 
-    Invalid
+    Loaded(R),
+    Missing,
+    Invalid,
 }
 
 /// Watch a JSON file for changes.
@@ -71,14 +71,14 @@ impl<T: Send> Loader<T, T> for StringLoader {
 
     async fn load(path: &Path, parse: &Self::Parse) -> LoadOutcome<T> {
         match fs::read_to_string(path).await {
-            Ok(data) => match parse(path, &data) { 
+            Ok(data) => match parse(path, &data) {
                 Ok(value) => LoadOutcome::Loaded(value),
                 Err(err) => {
                     error!(%err, path = %path.display(), "Error parsing data");
                     LoadOutcome::Invalid
-                },
-            } 
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadOutcome::Missing, 
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadOutcome::Missing,
             Err(err) => {
                 error!(%err, path = %path.display(), "Error reading file");
                 LoadOutcome::Invalid
@@ -96,15 +96,15 @@ where
     type Parse = fn(&Path, &str) -> Result<T, Error>;
 
     async fn load(path: &Path, parse: &Self::Parse) -> LoadOutcome<Vec<T>> {
-        let file = match File::open(path).await { 
-            Ok(file) => file, 
+        let file = match File::open(path).await {
+            Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
             Err(err) => {
                 error!(%err, path = %path.display(), "Error opening file");
-                return LoadOutcome::Invalid;       
-            } 
-        }; 
-        
+                return LoadOutcome::Invalid;
+            }
+        };
+
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let mut output = Vec::new();
@@ -150,13 +150,13 @@ where
 {
     let path = path.as_ref();
     let initial_value = match L::load(path, &parse).await {
-        LoadOutcome::Loaded(value) => Some(value), 
+        LoadOutcome::Loaded(value) => Some(value),
         LoadOutcome::Missing => {
-            error!(path = %path.display(), "File does not exist."); 
+            error!(path = %path.display(), "File does not exist.");
             None
         }
         LoadOutcome::Invalid => {
-            error!(path = %path.display(), "File exists but could not be loaded."); 
+            error!(path = %path.display(), "File exists but could not be loaded.");
             None
         }
     };
@@ -172,10 +172,10 @@ where
             }
 
             let send_result = match L::load(&path, &parse).await {
-                LoadOutcome::Loaded(value) => Some(tx.send(Some(value))), 
+                LoadOutcome::Loaded(value) => Some(tx.send(Some(value))),
                 LoadOutcome::Missing => Some(tx.send(None)),
                 LoadOutcome::Invalid => None,
-            }; 
+            };
 
             if let Some(Err(_)) = send_result {
                 info!(path = %path.display(), "Watch for file is closed.");
@@ -314,21 +314,53 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_delete() { 
+    async fn test_delete() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("file.txt");
 
-        // create the file 
+        // create the file
         fs::write(&file_path, r#"{"message": "Hello World!"}"#)
             .await
             .unwrap();
         let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
         {
             let value = watcher.borrow();
-            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!"); 
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
         }
 
-        // delete the file 
+        // delete the file
+        fs::remove_file(&file_path).await.unwrap();
+        watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert!(value.is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_delete_lines() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // create the file
+        fs::write(
+            &file_path,
+            r#"{"message": "Hello World!"}
+            {"message": "Hello Again!"}"#,
+        )
+        .await
+        .unwrap();
+        let mut watcher = jsonlines_watch::<Value>(&file_path).await.unwrap();
+
+        {
+            let value = watcher.borrow();
+            let vec = value.as_ref().unwrap();
+            assert_eq!(vec.len(), 2);
+            assert_eq!(vec[0]["message"], "Hello World!");
+            assert_eq!(vec[1]["message"], "Hello Again!");
+        }
+
         fs::remove_file(&file_path).await.unwrap();
         watcher.changed().await.unwrap();
         {
