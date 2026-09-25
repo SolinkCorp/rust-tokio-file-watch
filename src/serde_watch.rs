@@ -195,6 +195,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::settle;
+    use std::time::Duration;
 
     #[tokio::test]
     #[traced_test]
@@ -406,6 +407,45 @@ mod tests {
             .await
             .unwrap();
         watcher.changed().await.unwrap();
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World 2!");
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_invalid_keeps_last_value() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // Create the file
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+
+        let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
+
+        // Write data that is not valid JSON, for example a torn write
+        fs::write(&file_path, r#"{"message": "#).await.unwrap();
+
+        // Make sure that there is no notification, and that the last good value stays
+        let result = tokio::time::timeout(Duration::from_secs(3), watcher.changed()).await;
+        assert!(result.is_err(), "invalid data caused a notification");
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
+        }
+
+        // Write valid data again. This shows that the watcher still operates.
+        fs::write(&file_path, r#"{"message": "Hello World 2!"}"#)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("no change seen after valid data")
+            .unwrap();
         {
             let value = watcher.borrow();
             assert_eq!(value.as_ref().unwrap()["message"], "Hello World 2!");
