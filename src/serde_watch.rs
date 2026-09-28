@@ -16,12 +16,6 @@ use super::fs_watch::AsyncFsWatch;
 
 pub type JsonWatch<T> = watch::Receiver<Option<T>>;
 
-enum LoadOutcome<R> {
-    Loaded(R),
-    Missing,
-    Invalid,
-}
-
 /// Watch a JSON file for changes.
 ///
 /// This function updates the value in the returned receiver each time the file changes.
@@ -62,6 +56,12 @@ where
             .map_err(|e| Error::DecodeError(path.to_string_lossy().to_string(), e.to_string()))
     })
     .await
+}
+
+enum LoadOutcome<R> {
+    Loaded(R),
+    Missing,
+    Invalid,
 }
 
 struct StringLoader;
@@ -173,6 +173,7 @@ where
 
             let send_result = match L::load(&path, &parse).await {
                 LoadOutcome::Loaded(value) => Some(tx.send(Some(value))),
+                LoadOutcome::Missing if tx.borrow().is_none() => None,
                 LoadOutcome::Missing => Some(tx.send(None)),
                 LoadOutcome::Invalid => None,
             };
@@ -449,6 +450,40 @@ mod tests {
         {
             let value = watcher.borrow();
             assert_eq!(value.as_ref().unwrap()["message"], "Hello World 2!");
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_missing_does_not_repeat_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+
+        // Start the watcher when the file does not exist. The value is None.
+        let mut watcher = json_watch::<Value>(&file_path).await.unwrap();
+        settle(&mut watcher).await;
+        assert!(watcher.borrow().is_none());
+
+        // Cause events for the watched name while the file stays missing.
+        // The content is not valid JSON, so a load that finds the file also sends nothing.
+        fs::write(&file_path, "not json").await.unwrap();
+        fs::remove_file(&file_path).await.unwrap();
+
+        // Make sure that there is no notification, because the value is already None
+        let result = tokio::time::timeout(Duration::from_secs(3), watcher.changed()).await;
+        assert!(result.is_err(), "a second None caused a notification");
+
+        // Write valid data. This shows that the watcher still operates.
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("no change seen after valid data")
+            .unwrap();
+        {
+            let value = watcher.borrow();
+            assert_eq!(value.as_ref().unwrap()["message"], "Hello World!");
         }
     }
 }

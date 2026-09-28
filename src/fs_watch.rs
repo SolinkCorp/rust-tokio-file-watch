@@ -48,14 +48,19 @@ impl AsyncFsWatch {
 
         // Note that we actually watch the parent of the path - if the path we're interested
         // in doesn't exist, we'll get notified when it's created.
-        let path_to_watch = folder.as_ref().to_path_buf();
+        //
+        // A bare file name such as "file.json" has the parent "". Use "." for this case,
+        // because the macOS watcher does not accept an empty path.
+        let folder = folder.as_ref();
+        let path_to_watch = if folder.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            folder.to_path_buf()
+        };
         // Make sure the folder exists.
         fs::create_dir_all(&path_to_watch)
             .await
             .map_err(|e| Error::InvalidPath(format!("Could not create {path_to_watch:?}: {e}")))?;
-        let canonical_watch_dir: PathBuf = path_to_watch.canonicalize().map_err(|e| {
-            Error::InvalidPath(format!("Could not canonicalize {path_to_watch:?}: {e}"))
-        })?;
         let files = files.to_vec();
 
         let mut debouncer = {
@@ -66,9 +71,9 @@ impl AsyncFsWatch {
                     Ok(events) => {
                         // Ignore any events not for our watched file.
                         //
-                        // We canonicalize the watch directory once, before this closure runs.
-                        // The directory still exists after the file is deleted, so this
-                        // canonicalization cannot fail because of the delete.
+                        // The watch is not recursive. Thus, each event is for the watched
+                        // folder or for an item directly in it. The backend applies this
+                        // filter (inotify in the kernel, FSEvents in notify).
                         //
                         // See `is_watched` for how we match an event to a watched file.
 
@@ -76,7 +81,7 @@ impl AsyncFsWatch {
                         // this will start firing more or less continuously on the QNAP,
                         // even though the file isn't being modified.  :(
                         for event in events {
-                            if Self::is_watched(&event.path, &canonical_watch_dir, &files) {
+                            if Self::is_watched(&event.path, &path_to_watch, &files) {
                                 if let Err(err) = tx.send(()) {
                                     warn!(?err, ?event.path, "Error sending notification");
                                 }
@@ -105,29 +110,20 @@ impl AsyncFsWatch {
     }
 
     /// Return true if the event path is one of the watched files.
-    fn is_watched(event_path: &Path, canonical_watch_dir: &Path, files: &[OsString]) -> bool {
-        // Match by name. We canonicalize only the parent directory, because the
-        // file may not exist anymore. This match finds deletes.
-        let same_dir = event_path
-            .parent()
-            .and_then(|dir| dir.canonicalize().ok())
-            .is_some_and(|dir| dir == canonical_watch_dir);
-        if same_dir
-            && event_path
-                .file_name()
-                .is_some_and(|name| files.iter().any(|f| f == name))
+    fn is_watched(event_path: &Path, watch_dir: &Path, files: &[OsString]) -> bool {
+        // Match by name. This needs no file system call, and it finds deletes.
+        if event_path
+            .file_name()
+            .is_some_and(|name| files.iter().any(|f| f == name))
         {
             return true;
         }
-        // Match by resolved target. This match finds changes to a file that a watched
-        // name links to, in the same directory. Both paths must exist, so this match
-        // cannot find a delete. We resolve the watched file on each event, because the
-        // link can change to a different target.
+        // Match by resolved target, for a watched name that is a symlink.
         let Ok(canonical_event) = event_path.canonicalize() else {
             return false;
         };
         files.iter().any(|f| {
-            canonical_watch_dir
+            watch_dir
                 .join(f)
                 .canonicalize()
                 .is_ok_and(|p| p == canonical_event)
@@ -254,5 +250,52 @@ mod test {
 
         // Wait for the file to change
         watcher.changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bare_file_name() {
+        // Remove the file from the current directory when the test ends.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+
+        // Use a name that has the process ID, so that parallel runs do not collide.
+        let name = format!("bare-file-{}.json", std::process::id());
+        let _guard = RemoveOnDrop(std::env::current_dir().unwrap().join(&name));
+        fs::write(&name, "Hello, world!").unwrap();
+
+        let result = AsyncFsWatch::watch(&name).await;
+        assert!(result.is_ok(), "watch failed: {:?}", result.err());
+        let mut watcher = result.unwrap();
+        settle(&mut watcher.rx).await;
+
+        // Update the file through the relative path
+        fs::write(&name, "Hello, world 2!").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("no change seen for bare file name")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_same_name_in_subfolder_is_ignored() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+        let sub_file_path = temp_dir.path().join("sub/file.txt");
+        fs::create_dir(temp_dir.path().join("sub")).unwrap();
+
+        let mut watcher = AsyncFsWatch::watch(&file_path).await.unwrap();
+        settle(&mut watcher.rx).await;
+
+        // Write a file that has the watched name, but in a subfolder.
+        // The watch is not recursive, so this must not cause a notification.
+        fs::write(&sub_file_path, "Hello, world!").unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(3), watcher.changed()).await;
+        assert!(result.is_err(), "subfolder file caused a notification");
     }
 }
