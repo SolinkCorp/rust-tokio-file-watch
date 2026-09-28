@@ -1,6 +1,8 @@
+mod error;
 mod fs_watch;
 mod serde_watch;
-mod error;
+#[cfg(test)]
+mod test_utils;
 
 pub use error::Error;
 pub use serde_watch::*;
