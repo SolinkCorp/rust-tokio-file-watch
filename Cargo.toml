@@ -1,6 +1,6 @@
 [package]
 name = "solink-tokio-file-watch"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "A reusable file watcher"
 license = "MIT"
@@ -14,7 +14,7 @@ serde = "1.0.203"
 serde_json = { version = "1.0.140" }
 trait-variant = "0.1.2"
 thiserror = "2.0.12"
-tokio = { version = "1.38.0", features = ["io-util", "fs", "rt", "sync"] }
+tokio = { version = "1.38.0", features = ["io-util", "fs", "macros", "rt", "sync"] }
 tracing = "0.1.41"
 notify = { version = "6.1.1", default-features = false, features = [
     "macos_fsevent",
