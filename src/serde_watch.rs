@@ -166,9 +166,17 @@ where
     let path = path.to_path_buf();
     tokio::task::spawn(async move {
         loop {
-            if let Err(err) = watch.changed().await {
-                error!(%err, path = %path.display(), "Error watching file");
-                break;
+            tokio::select! {
+                () = tx.closed() => {
+                    info!(path = %path.display(), "Watch for file is closed.");
+                    break;
+                }
+                res = watch.changed() => {
+                    if let Err(err) = res {
+                        error!(%err, path = %path.display(), "Error watching file");
+                        break;
+                    }
+                }
             }
 
             let send_result = match L::load(&path, &parse).await {
@@ -197,6 +205,28 @@ mod tests {
     use super::*;
     use crate::test_utils::settle;
     use std::time::Duration;
+
+    #[tokio::test]
+    #[traced_test]
+    async fn dropping_the_receiver_stops_the_watch() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("file.json");
+        fs::write(&file_path, r#"{"message": "Hello World!"}"#)
+            .await
+            .unwrap();
+        let watcher = json_watch::<Value>(&file_path).await.unwrap();
+
+        drop(watcher);
+
+        let stopped = async {
+            while !logs_contain("Watch for file is closed.") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), stopped)
+            .await
+            .expect("the watch task must stop when every receiver is dropped");
+    }
 
     #[tokio::test]
     #[traced_test]
